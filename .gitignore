@@ -1,0 +1,33 @@
+# Prompts e specs de desenvolvimento (raiz)
+youtube-scheduler-DEVELOPMENT-MASTER-PROMPT-v1.0.md
+youtube-scheduler-SPEC-v1.0.md
+
+# Graphify outputs
+graphify-out/
+
+# Node
+node_modules/
+dist/
+
+# Environment
+.env
+.env.local
+
+# OS
+Thumbs.db
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+logs/
+*.log
+
+# Database
+data/*.db
+data/*.db-journal
+
+# Build
+*.tsbuildinfo
