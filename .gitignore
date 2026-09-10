@@ -9,9 +9,10 @@ graphify-out/
 node_modules/
 dist/
 
-# Environment
+# Environment & Secrets
 .env
 .env.local
+client_secret*.json
 
 # OS
 Thumbs.db

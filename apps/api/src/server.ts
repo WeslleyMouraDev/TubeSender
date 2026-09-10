@@ -2,9 +2,13 @@ import { buildApp } from './app.js';
 import { env } from './config/env.js';
 import { logger } from './config/logger.js';
 import { prisma } from './db/prisma.js';
+import { UploadQueueService } from './services/upload/queue.service.js';
 
 async function main() {
   const app = await buildApp();
+
+  // Retomada e recuperação da fila de uploads após reinicialização (FASE 6)
+  await UploadQueueService.recoverQueueOnStartup();
 
   const shutdown = async (signal: string) => {
     logger.info(`Recebido sinal ${signal}. Encerrando servidor com segurança...`);

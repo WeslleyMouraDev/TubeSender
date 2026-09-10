@@ -4,6 +4,15 @@ import { ZodError } from 'zod';
 import { env } from './config/env.js';
 import { logger } from './config/logger.js';
 import { healthRoutes } from './routes/health.js';
+import { authRoutes } from './routes/auth.js';
+import { channelRoutes } from './routes/channel.js';
+import { scheduleRoutes } from './routes/schedule.js';
+import { batchRoutes } from './routes/batches.js';
+import { queueRoutes } from './routes/queue.js';
+import { videoRoutes } from './routes/videos.js';
+import { profileRoutes } from './routes/profiles.js';
+import { diagnosticsRoutes } from './routes/diagnostics.js';
+import { logRoutes } from './routes/logs.js';
 
 export async function buildApp() {
   const app = fastify({
@@ -68,6 +77,15 @@ export async function buildApp() {
 
   // Registro de rotas com prefixo /api
   await app.register(healthRoutes, { prefix: '/api' });
+  await app.register(authRoutes, { prefix: '/api' });
+  await app.register(channelRoutes, { prefix: '/api' });
+  await app.register(scheduleRoutes, { prefix: '/api' });
+  await app.register(batchRoutes, { prefix: '/api' });
+  await app.register(queueRoutes, { prefix: '/api' });
+  await app.register(videoRoutes, { prefix: '/api' });
+  await app.register(profileRoutes, { prefix: '/api' });
+  await app.register(diagnosticsRoutes, { prefix: '/api' });
+  await app.register(logRoutes, { prefix: '/api' });
 
   return app;
 }

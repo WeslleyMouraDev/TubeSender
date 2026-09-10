@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, beforeEach, vi } from 'vitest';
 import { HealthResponseSchema } from '@tubesender/shared';
 import { buildApp, type AppInstance } from '../src/app.js';
 import { prisma } from '../src/db/prisma.js';
@@ -13,6 +13,11 @@ describe('GET /api/health', () => {
   afterAll(async () => {
     await app.close();
     await prisma.$disconnect();
+  });
+
+  beforeEach(async () => {
+    await prisma.oAuthAccount.deleteMany();
+    await prisma.channel.deleteMany();
   });
 
   it('deve responder com status ok e schema válido', async () => {
