@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { FastifyPluginAsync } from 'fastify';
 import { prisma } from '../db/prisma.js';
-import { OAuthService } from '../services/auth/oauth.service.js';
+import { env } from '../config/env.js';
 import type { DiagnosticResult } from '@tubesender/shared';
 
 export const diagnosticsRoutes: FastifyPluginAsync = async (app) => {
@@ -80,13 +80,14 @@ export const diagnosticsRoutes: FastifyPluginAsync = async (app) => {
     }
 
     // 4. Modo de Operação da YouTube API
-    const isMock = OAuthService.isMockMode();
+    const hasCredentials = Boolean(env.GOOGLE_CLIENT_ID && env.GOOGLE_CLIENT_SECRET);
     results.push({
-      name: 'Integração YouTube Data API',
-      status: 'pass',
-      message: isMock
-        ? 'Modo de simulação (Mock) ativo para testes locais seguros'
-        : 'Credenciais de produção configuradas para YouTube Data API v3',
+      name: 'Credenciais Google Cloud OAuth',
+      status: hasCredentials ? 'pass' : 'warn',
+      message: hasCredentials
+        ? 'Credenciais do Google OAuth configuradas no .env'
+        : 'Credenciais ausentes no .env (defina GOOGLE_CLIENT_ID e GOOGLE_CLIENT_SECRET)',
+      details: hasCredentials ? `Client ID: ${env.GOOGLE_CLIENT_ID.slice(0, 15)}...` : undefined,
     });
 
     return reply.send({

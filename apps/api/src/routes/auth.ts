@@ -12,20 +12,29 @@ export const authRoutes: FastifyPluginAsync = async (app) => {
 
   // Inicia o fluxo OAuth 2.0 gerando a URL de autorização
   app.get('/auth/google/start', async (request, reply) => {
-    const query = request.query as { redirect?: string };
-    const authUrl = OAuthService.getAuthUrl(query.redirect);
+    const query = request.query as { redirect_uri?: string; redirect?: string };
+    const customRedirectUri = query.redirect_uri || query.redirect;
+    const authUrl = OAuthService.getAuthUrl(customRedirectUri);
     return reply.send({ url: authUrl });
   });
 
   // Callback de autorização do Google
   app.get('/auth/google/callback', async (request, reply) => {
     const querySchema = z.object({
-      code: z.string().min(1, 'Código de autorização ausente'),
+      code: z.string().optional(),
       error: z.string().optional(),
+      error_description: z.string().optional(),
     });
 
     const parsed = querySchema.safeParse(request.query);
-    if (!parsed.success) {
+    const isBrowserRequest = (request.headers.accept || '').includes('text/html');
+
+    if (!parsed.success || (!parsed.data.code && !parsed.data.error)) {
+      if (isBrowserRequest) {
+        return reply.redirect(
+          `http://localhost:${env.WEB_PORT}/?auth=error&message=${encodeURIComponent('Código de autorização não fornecido pelo Google')}`
+        );
+      }
       return reply.status(400).send({
         error: 'Bad Request',
         message: 'Código de autorização não fornecido ou inválido',
@@ -33,19 +42,24 @@ export const authRoutes: FastifyPluginAsync = async (app) => {
     }
 
     if (parsed.data.error) {
+      const errorMsg = parsed.data.error_description || parsed.data.error;
+      if (isBrowserRequest) {
+        return reply.redirect(
+          `http://localhost:${env.WEB_PORT}/?auth=error&message=${encodeURIComponent(errorMsg)}`
+        );
+      }
       return reply.status(400).send({
         error: 'OAuth Error',
-        message: `Erro retornado pelo Google: ${parsed.data.error}`,
+        message: `Erro retornado pelo Google: ${errorMsg}`,
       });
     }
 
     try {
-      const channel = await OAuthService.handleCallback(parsed.data.code);
+      const channel = await OAuthService.handleCallback(parsed.data.code!);
 
       // Redireciona de volta para o frontend se for chamada pelo navegador direto
-      const acceptHeader = request.headers.accept || '';
-      if (acceptHeader.includes('text/html')) {
-        return reply.redirect(`http://localhost:${env.WEB_PORT}/?auth=success`);
+      if (isBrowserRequest) {
+        return reply.redirect(`http://localhost:${env.WEB_PORT}/?auth=success&channel=${encodeURIComponent(channel.title)}`);
       }
 
       return reply.send({
@@ -58,6 +72,11 @@ export const authRoutes: FastifyPluginAsync = async (app) => {
         },
       });
     } catch (err: any) {
+      if (isBrowserRequest) {
+        return reply.redirect(
+          `http://localhost:${env.WEB_PORT}/?auth=error&message=${encodeURIComponent(err.message || 'Falha ao processar autorização')}`
+        );
+      }
       return reply.status(500).send({
         error: 'OAuth Callback Failed',
         message: err.message || 'Falha ao processar autorização',

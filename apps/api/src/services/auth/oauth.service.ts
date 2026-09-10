@@ -11,31 +11,32 @@ export const YOUTUBE_SCOPES = [
 ];
 
 export class OAuthService {
-  public static isMockMode(): boolean {
-    return (
-      process.env.MOCK_OAUTH === 'true' ||
-      !env.GOOGLE_CLIENT_ID ||
-      !env.GOOGLE_CLIENT_SECRET
-    );
-  }
-
+  /**
+   * Retorna instância configurada do cliente Google OAuth2.
+   * Não utiliza mocks: requer credenciais reais no .env.
+   */
   public static getOAuth2Client(redirectUri?: string) {
+    if (!env.GOOGLE_CLIENT_ID || !env.GOOGLE_CLIENT_SECRET) {
+      throw new Error(
+        'Credenciais do Google OAuth ausentes. Configure GOOGLE_CLIENT_ID e GOOGLE_CLIENT_SECRET no arquivo .env.'
+      );
+    }
+
     const callbackUrl = redirectUri || env.GOOGLE_REDIRECT_URI;
     return new google.auth.OAuth2(
-      env.GOOGLE_CLIENT_ID || 'mock-client-id',
-      env.GOOGLE_CLIENT_SECRET || 'mock-client-secret',
+      env.GOOGLE_CLIENT_ID,
+      env.GOOGLE_CLIENT_SECRET,
       callbackUrl
     );
   }
 
+  /**
+   * Gera URL real de autorização do Google OAuth 2.0.
+   */
   public static getAuthUrl(redirectUri?: string): string {
     const callbackUrl = redirectUri || env.GOOGLE_REDIRECT_URI;
-    if (this.isMockMode()) {
-      logger.info({ mode: 'mock' }, 'Gerando URL de autenticação mock');
-      return `${callbackUrl}?code=mock_google_oauth_code_success`;
-    }
-
     const oauth2Client = this.getOAuth2Client(callbackUrl);
+
     return oauth2Client.generateAuthUrl({
       access_type: 'offline',
       prompt: 'consent',
@@ -43,81 +44,19 @@ export class OAuthService {
     });
   }
 
+  /**
+   * Processa o código de autorização retornado pelo Google,
+   * troca por tokens reais e persiste os dados reais do canal.
+   */
   public static async handleCallback(code: string, redirectUri?: string) {
     const callbackUrl = redirectUri || env.GOOGLE_REDIRECT_URI;
-
-    if (this.isMockMode() || code.startsWith('mock_')) {
-      logger.info({ mode: 'mock' }, 'Processando callback OAuth em modo mock');
-      const mockChannelId = 'UC_MOCK_CHANNEL_123';
-      const mockTitle = 'IA Sem Complicar';
-      const mockThumbnail = 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=100&auto=format&fit=crop&q=60';
-      const mockPlaylistId = 'UU_MOCK_PLAYLIST_123';
-
-      const channel = await prisma.channel.upsert({
-        where: { youtubeChannelId: mockChannelId },
-        create: {
-          youtubeChannelId: mockChannelId,
-          title: mockTitle,
-          thumbnailUrl: mockThumbnail,
-          uploadsPlaylistId: mockPlaylistId,
-          oauthAccount: {
-            create: {
-              accessToken: 'mock_access_token_' + Date.now(),
-              refreshToken: 'mock_refresh_token_123',
-              tokenType: 'Bearer',
-              scope: YOUTUBE_SCOPES.join(' '),
-              expiresAt: new Date(Date.now() + 3600 * 1000 * 24),
-            },
-          },
-          syncState: {
-            create: {
-              status: 'IDLE',
-            },
-          },
-        },
-        update: {
-          title: mockTitle,
-          thumbnailUrl: mockThumbnail,
-          uploadsPlaylistId: mockPlaylistId,
-          oauthAccount: {
-            upsert: {
-              create: {
-                accessToken: 'mock_access_token_' + Date.now(),
-                refreshToken: 'mock_refresh_token_123',
-                tokenType: 'Bearer',
-                scope: YOUTUBE_SCOPES.join(' '),
-                expiresAt: new Date(Date.now() + 3600 * 1000 * 24),
-              },
-              update: {
-                accessToken: 'mock_access_token_' + Date.now(),
-                refreshToken: 'mock_refresh_token_123',
-                expiresAt: new Date(Date.now() + 3600 * 1000 * 24),
-              },
-            },
-          },
-        },
-        include: {
-          oauthAccount: true,
-        },
-      });
-
-      await prisma.operationLog.create({
-        data: {
-          level: 'INFO',
-          category: 'AUTH',
-          message: 'Canal autenticado com sucesso (Modo Mock)',
-          metadata: JSON.stringify({ channelId: channel.id, youtubeChannelId: channel.youtubeChannelId }),
-        },
-      });
-
-      return channel;
-    }
-
-    // Fluxo real com Google OAuth2
     const oauth2Client = this.getOAuth2Client(callbackUrl);
+
+    // Troca o código pelos tokens reais
     const { tokens } = await oauth2Client.getToken(code);
     oauth2Client.setCredentials(tokens);
 
+    // Consulta canal real autenticado na YouTube Data API v3
     const youtube = google.youtube({ version: 'v3', auth: oauth2Client });
     const response = await youtube.channels.list({
       part: ['snippet', 'contentDetails'],
@@ -126,7 +65,7 @@ export class OAuthService {
 
     const items = response.data.items;
     if (!items || items.length === 0) {
-      throw new Error('Nenhum canal do YouTube encontrado para a conta informada');
+      throw new Error('Nenhum canal do YouTube encontrado para a conta do Google informada.');
     }
 
     const channelData = items[0];
@@ -139,6 +78,7 @@ export class OAuthService {
     const uploadsPlaylistId =
       channelData.contentDetails?.relatedPlaylists?.uploads || null;
 
+    // Salva ou atualiza os dados reais no SQLite
     const channel = await prisma.channel.upsert({
       where: { youtubeChannelId },
       create: {
@@ -191,7 +131,7 @@ export class OAuthService {
       data: {
         level: 'INFO',
         category: 'AUTH',
-        message: 'Canal conectado com sucesso',
+        message: `Canal "${channel.title}" conectado com sucesso`,
         metadata: JSON.stringify({ channelId: channel.id, youtubeChannelId: channel.youtubeChannelId }),
       },
     });
@@ -199,6 +139,61 @@ export class OAuthService {
     return channel;
   }
 
+  /**
+   * Retorna o cliente da YouTube Data API v3 autenticado com o canal ativo.
+   * Renova automaticamente o access token se expirado.
+   */
+  public static async getAuthenticatedYouTubeClient() {
+    const channel = await prisma.channel.findFirst({
+      where: { oauthAccount: { isNot: null } },
+      include: { oauthAccount: true },
+    });
+
+    if (!channel || !channel.oauthAccount) {
+      throw new Error('Nenhum canal do YouTube conectado. Faça login antes de continuar.');
+    }
+
+    const oauth2Client = this.getOAuth2Client();
+    oauth2Client.setCredentials({
+      access_token: channel.oauthAccount.accessToken,
+      refresh_token: channel.oauthAccount.refreshToken ?? undefined,
+    });
+
+    // Se o token estiver expirado, renova com refresh token
+    const now = new Date();
+    if (
+      channel.oauthAccount.expiresAt &&
+      channel.oauthAccount.expiresAt < now &&
+      channel.oauthAccount.refreshToken
+    ) {
+      try {
+        const { credentials } = await oauth2Client.refreshAccessToken();
+        oauth2Client.setCredentials(credentials);
+
+        await prisma.oAuthAccount.update({
+          where: { id: channel.oauthAccount.id },
+          data: {
+            accessToken: credentials.access_token || channel.oauthAccount.accessToken,
+            expiresAt: credentials.expiry_date ? new Date(credentials.expiry_date) : null,
+          },
+        });
+        logger.info({ channelId: channel.id }, 'Access token renovado com sucesso via refresh token');
+      } catch (err: any) {
+        logger.error({ err: err.message }, 'Falha ao renovar token OAuth do canal');
+        throw new Error(`Falha ao renovar autenticação do YouTube: ${err.message}`);
+      }
+    }
+
+    return {
+      youtube: google.youtube({ version: 'v3', auth: oauth2Client }),
+      channel,
+      oauth2Client,
+    };
+  }
+
+  /**
+   * Retorna o status atual de conexão do canal.
+   */
   public static async getStatus(): Promise<OAuthStatusResponse> {
     const channel = await prisma.channel.findFirst({
       where: { oauthAccount: { isNot: null } },
@@ -209,13 +204,12 @@ export class OAuthService {
       return { connected: false };
     }
 
-    // Verifica renovação de token se expirado
+    // Verifica e renova token se expirado
     const now = new Date();
     if (
       channel.oauthAccount.expiresAt &&
       channel.oauthAccount.expiresAt < now &&
-      channel.oauthAccount.refreshToken &&
-      !this.isMockMode()
+      channel.oauthAccount.refreshToken
     ) {
       try {
         const oauth2Client = this.getOAuth2Client();
@@ -232,7 +226,7 @@ export class OAuthService {
           },
         });
       } catch (err: any) {
-        logger.error({ err: err.message }, 'Falha ao renovar access token com refresh token');
+        logger.error({ err: err.message }, 'Falha ao renovar access token com refresh token no getStatus');
       }
     }
 
@@ -249,6 +243,9 @@ export class OAuthService {
     };
   }
 
+  /**
+   * Desconecta o canal e remove tokens locais.
+   */
   public static async logout(): Promise<{ success: boolean }> {
     const channel = await prisma.channel.findFirst({
       where: { oauthAccount: { isNot: null } },
@@ -263,7 +260,7 @@ export class OAuthService {
         data: {
           level: 'INFO',
           category: 'AUTH',
-          message: 'Desconectado da conta do YouTube / Google',
+          message: 'Canal desconectado com sucesso',
         },
       });
     }

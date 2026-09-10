@@ -1,5 +1,4 @@
 import fs from 'node:fs';
-import { google } from 'googleapis';
 import { logger } from '../../config/logger.js';
 import { prisma } from '../../db/prisma.js';
 import { OAuthService } from '../auth/oauth.service.js';
@@ -14,16 +13,11 @@ export interface UploadExecutionOptions {
 
 export class UploadService {
   /**
-   * Valida integridade do arquivo local antes do upload
+   * Valida integridade e existência física do arquivo local antes do upload.
    */
   public static async validateFile(filePath: string): Promise<{ size: number }> {
-    if (OAuthService.isMockMode() && !fs.existsSync(filePath)) {
-      // Em modo mock se o caminho for simulado (ex: C:/Videos/...), permite tamanho padrão
-      return { size: 10 * 1024 * 1024 };
-    }
-
     if (!fs.existsSync(filePath)) {
-      throw new Error(`Arquivo não encontrado: "${filePath}". Selecione novamente o arquivo antes de continuar.`);
+      throw new Error(`Arquivo não encontrado no disco: "${filePath}". Selecione novamente o arquivo antes de continuar.`);
     }
 
     const stat = await fs.promises.stat(filePath);
@@ -39,7 +33,7 @@ export class UploadService {
   }
 
   /**
-   * Executa upload de um único VideoDraft para o YouTube
+   * Executa upload real de um único VideoDraft para o YouTube Data API v3.
    */
   public static async uploadVideo(options: UploadExecutionOptions) {
     const draft = await prisma.videoDraft.findUniqueOrThrow({
@@ -47,7 +41,7 @@ export class UploadService {
       include: { batch: true },
     });
 
-    // 1. Validação de estado inicial e arquivo
+    // 1. Validação de estado inicial e arquivo físico
     await prisma.videoDraft.update({
       where: { id: draft.id },
       data: { status: 'VALIDATING', errorMessage: null },
@@ -61,7 +55,7 @@ export class UploadService {
 
     const fileMeta = await this.validateFile(draft.localPath);
 
-    // 2. Prevenção de duplicatas: se já tem youtubeVideoId, não faz videos.insert!
+    // 2. Prevenção estrita de duplicatas: se já tem youtubeVideoId, NUNCA repete videos.insert!
     let youtubeVideoId = draft.youtubeVideoId;
 
     if (!youtubeVideoId) {
@@ -77,103 +71,77 @@ export class UploadService {
         status: 'UPLOADING',
       });
 
-      if (OAuthService.isMockMode()) {
-        logger.info({ draftId: draft.id }, 'Simulando upload em modo mock');
+      // Obtém cliente autenticado real com token atualizado
+      const { youtube } = await OAuthService.getAuthenticatedYouTubeClient();
 
-        // Simula progresso SSE
-        const totalBytes = fileMeta.size || 10485760;
-        const steps = [0.25, 0.5, 0.75, 1.0];
-        for (const step of steps) {
-          const sent = Math.round(totalBytes * step);
-          const pct = Math.round(step * 100);
-          sseBroker.emit({
-            type: 'upload.progress',
-            draftId: draft.id,
-            batchId: draft.batchId,
-            bytesSent: sent,
-            totalBytes,
-            percentage: pct,
-          });
-          options.onProgress?.(sent, totalBytes, pct);
-          await new Promise((resolve) => setTimeout(resolve, 30));
+      const publishAtISO = draft.scheduledAt
+        ? draft.scheduledAt.toISOString()
+        : new Date(Date.now() + 3600 * 1000 * 24).toISOString();
+
+      let tags: string[] = [];
+      if (draft.customTags) {
+        try {
+          tags = JSON.parse(draft.customTags);
+        } catch {
+          tags = [];
         }
-
-        youtubeVideoId = `mock_yt_${draft.id.slice(-8)}`;
-
-        // Gravação imediata do youtubeVideoId no banco
-        await prisma.videoDraft.update({
-          where: { id: draft.id },
-          data: {
-            youtubeVideoId,
-            status: 'UPLOADED',
-          },
-        });
-      } else {
-        // Upload real via Google API
-        const channel = await prisma.channel.findFirst({
-          include: { oauthAccount: true },
-        });
-        if (!channel || !channel.oauthAccount) {
-          throw new Error('Canal não conectado. Realize login antes de iniciar uploads.');
-        }
-
-        const oauth2Client = OAuthService.getOAuth2Client();
-        oauth2Client.setCredentials({
-          access_token: channel.oauthAccount.accessToken,
-          refresh_token: channel.oauthAccount.refreshToken ?? undefined,
-        });
-
-        const youtube = google.youtube({ version: 'v3', auth: oauth2Client });
-
-        const publishAtISO = draft.scheduledAt
-          ? draft.scheduledAt.toISOString()
-          : new Date(Date.now() + 3600 * 1000 * 24).toISOString();
-
-        let tags: string[] = [];
-        if (draft.customTags) {
-          try {
-            tags = JSON.parse(draft.customTags);
-          } catch {
-            tags = [];
-          }
-        }
-
-        const insertResponse = await youtube.videos.insert({
-          part: ['snippet', 'status'],
-          requestBody: {
-            snippet: {
-              title: draft.title,
-              description: draft.customDescription || '',
-              tags,
-            },
-            status: {
-              privacyStatus: 'private', // REGRA CRÍTICA: Sempre private para vídeos agendados
-              publishAt: publishAtISO,
-              selfDeclaredMadeForKids: false,
-            },
-          },
-          media: {
-            body: fs.createReadStream(draft.localPath),
-          },
-        });
-
-        youtubeVideoId = insertResponse.data.id || null;
-        if (!youtubeVideoId) {
-          throw new Error('A API do YouTube não retornou um ID de vídeo após upload');
-        }
-
-        // Gravação imediata do ID
-        await prisma.videoDraft.update({
-          where: { id: draft.id },
-          data: {
-            youtubeVideoId,
-            status: 'UPLOADED',
-          },
-        });
       }
+
+      // Stream de leitura com acompanhamento de progresso real
+      const totalBytes = fileMeta.size;
+      let uploadedBytes = 0;
+      const fileStream = fs.createReadStream(draft.localPath);
+
+      fileStream.on('data', (chunk) => {
+        uploadedBytes += chunk.length;
+        const percentage = Math.min(100, Math.round((uploadedBytes / totalBytes) * 100));
+        sseBroker.emit({
+          type: 'upload.progress',
+          draftId: draft.id,
+          batchId: draft.batchId,
+          bytesSent: uploadedBytes,
+          totalBytes,
+          percentage,
+        });
+        options.onProgress?.(uploadedBytes, totalBytes, percentage);
+      });
+
+      // Chamada real à API do YouTube
+      const insertResponse = await youtube.videos.insert({
+        part: ['snippet', 'status'],
+        requestBody: {
+          snippet: {
+            title: draft.title,
+            description: draft.customDescription || '',
+            tags,
+          },
+          status: {
+            privacyStatus: 'private', // REGRA CRÍTICA DA SPEC: Sempre private com publishAt para vídeos agendados
+            publishAt: publishAtISO,
+            selfDeclaredMadeForKids: false,
+          },
+        },
+        media: {
+          body: fileStream,
+        },
+      });
+
+      youtubeVideoId = insertResponse.data.id || null;
+      if (!youtubeVideoId) {
+        throw new Error('A API do YouTube concluiu o upload mas não retornou um ID de vídeo.');
+      }
+
+      // Gravação imediata do ID recebido no banco operacional
+      await prisma.videoDraft.update({
+        where: { id: draft.id },
+        data: {
+          youtubeVideoId,
+          status: 'UPLOADED',
+        },
+      });
     }
 
-    // 3. Verificação de confirmação (VERIFYING)
+    // 3. Verificação de confirmação no YouTube (VERIFYING)
     await prisma.videoDraft.update({
       where: { id: draft.id },
       data: { status: 'VERIFYING' },
@@ -186,26 +154,15 @@ export class UploadService {
       youtubeVideoId,
     });
 
-    if (!OAuthService.isMockMode()) {
-      const channel = await prisma.channel.findFirst({
-        include: { oauthAccount: true },
-      });
-      const oauth2Client = OAuthService.getOAuth2Client();
-      oauth2Client.setCredentials({
-        access_token: channel!.oauthAccount!.accessToken,
-        refresh_token: channel!.oauthAccount!.refreshToken ?? undefined,
-      });
-      const youtube = google.youtube({ version: 'v3', auth: oauth2Client });
+    const { youtube: verifyYouTube } = await OAuthService.getAuthenticatedYouTubeClient();
+    const listRes = await verifyYouTube.videos.list({
+      id: [youtubeVideoId],
+      part: ['status'],
+    });
 
-      const listRes = await youtube.videos.list({
-        id: [youtubeVideoId],
-        part: ['status'],
-      });
-
-      const item = listRes.data.items?.[0];
-      if (!item || item.status?.privacyStatus !== 'private') {
-        throw new Error(`Falha na verificação do vídeo ${youtubeVideoId}: status não é privado`);
-      }
+    const item = listRes.data.items?.[0];
+    if (!item || item.status?.privacyStatus !== 'private') {
+      throw new Error(`Falha na verificação do vídeo ${youtubeVideoId} no YouTube: status não é privado ou vídeo não encontrado`);
     }
 
     // 4. Pós-upload: Thumbnail e Playlist com isolamento de falhas (FASE 9)

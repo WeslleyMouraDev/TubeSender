@@ -1,4 +1,3 @@
-import { google } from 'googleapis';
 import { logger } from '../../config/logger.js';
 import { prisma } from '../../db/prisma.js';
 import { OAuthService } from '../auth/oauth.service.js';
@@ -11,17 +10,12 @@ export interface SyncStats {
 }
 
 export class YouTubeSyncService {
+  /**
+   * Sincroniza os vídeos reais do canal do YouTube com o SQLite local.
+   * Consulta a playlist de uploads do canal com paginação real via nextPageToken.
+   */
   public static async syncChannel(): Promise<SyncStats> {
-    const channel = await prisma.channel.findFirst({
-      include: {
-        oauthAccount: true,
-        syncState: true,
-      },
-    });
-
-    if (!channel) {
-      throw new Error('Nenhum canal do YouTube conectado para sincronização');
-    }
+    const { youtube, channel } = await OAuthService.getAuthenticatedYouTubeClient();
 
     // Atualiza estado de sincronização para SYNCING
     await prisma.syncState.upsert({
@@ -37,40 +31,6 @@ export class YouTubeSyncService {
     });
 
     try {
-      if (OAuthService.isMockMode()) {
-        logger.info({ channelId: channel.id }, 'Executando sincronização em modo mock');
-        const stats = await this.syncMockVideos(channel.id);
-
-        await prisma.syncState.update({
-          where: { channelId: channel.id },
-          data: {
-            status: 'IDLE',
-            lastSyncedAt: new Date(),
-            errorMessage: null,
-          },
-        });
-
-        await prisma.operationLog.create({
-          data: {
-            level: 'INFO',
-            category: 'SYNC',
-            message: `Sincronização concluída (Mock): ${stats.total} vídeos`,
-            metadata: JSON.stringify(stats),
-          },
-        });
-
-        return stats;
-      }
-
-      // Fluxo real com YouTube API
-      const oauth2Client = OAuthService.getOAuth2Client();
-      oauth2Client.setCredentials({
-        access_token: channel.oauthAccount?.accessToken,
-        refresh_token: channel.oauthAccount?.refreshToken ?? undefined,
-      });
-
-      const youtube = google.youtube({ version: 'v3', auth: oauth2Client });
-
       let uploadsPlaylistId = channel.uploadsPlaylistId;
       if (!uploadsPlaylistId) {
         const chRes = await youtube.channels.list({
@@ -87,59 +47,66 @@ export class YouTubeSyncService {
       }
 
       if (!uploadsPlaylistId) {
-        throw new Error('Playlist de uploads não encontrada para o canal');
+        throw new Error('Não foi possível identificar a playlist de uploads do canal no YouTube');
       }
 
-      let pageToken: string | undefined = undefined;
+      // 1. Percorre a playlist de uploads completa utilizando paginação por nextPageToken
       const allVideoIds: string[] = [];
+      let pageToken: string | undefined = undefined;
 
-      do {
+      while (true) {
         const playlistRes: any = await youtube.playlistItems.list({
-          playlistId: uploadsPlaylistId,
           part: ['contentDetails'],
+          playlistId: uploadsPlaylistId,
           maxResults: 50,
           pageToken,
         });
 
         const items = playlistRes.data.items || [];
         for (const item of items) {
-          if (item.contentDetails?.videoId) {
-            allVideoIds.push(item.contentDetails.videoId);
+          const videoId = item.contentDetails?.videoId;
+          if (videoId) {
+            allVideoIds.push(videoId);
           }
         }
 
         pageToken = playlistRes.data.nextPageToken || undefined;
-      } while (pageToken);
+        if (!pageToken) {
+          break;
+        }
+      }
 
+      // 2. Busca os detalhes completos de cada vídeo em lotes de 50
       let publishedCount = 0;
       let scheduledCount = 0;
       let privateCount = 0;
+      const now = new Date();
 
-      // Pega os detalhes dos vídeos em blocos de até 50
-      const chunkSize = 50;
-      for (let i = 0; i < allVideoIds.length; i += chunkSize) {
-        const chunk = allVideoIds.slice(i, i + chunkSize);
+      for (let i = 0; i < allVideoIds.length; i += 50) {
+        const batchIds = allVideoIds.slice(i, i + 50);
         const videosRes = await youtube.videos.list({
-          id: chunk,
-          part: ['snippet', 'status'],
+          part: ['snippet', 'status', 'contentDetails'],
+          id: batchIds,
         });
 
         const videoItems = videosRes.data.items || [];
         for (const v of videoItems) {
-          const vId = v.id!;
-          const privacyStatus = v.status?.privacyStatus || 'private';
-          const publishAtStr = v.status?.publishAt;
-          const publishAt = publishAtStr ? new Date(publishAtStr) : null;
-          const publishedAtStr = v.snippet?.publishedAt;
-          const publishedAt = publishedAtStr ? new Date(publishedAtStr) : null;
+          const vId = v.id;
+          if (!vId) continue;
 
-          const now = new Date();
-          const isScheduled = privacyStatus === 'private' && publishAt !== null && publishAt > now;
-          if (isScheduled) {
+          const privacyStatus = v.status?.privacyStatus || 'private';
+          const publishAt = v.status?.publishAt ? new Date(v.status.publishAt) : null;
+          const publishedAt = v.snippet?.publishedAt ? new Date(v.snippet.publishedAt) : null;
+
+          // Classificação estrita conforme SPEC:
+          // Agendado: private com publishAt futuro
+          // Publicado: public
+          // Privado: private sem publishAt
+          if (privacyStatus === 'private' && publishAt && publishAt > now) {
             scheduledCount++;
           } else if (privacyStatus === 'public') {
             publishedCount++;
-          } else {
+          } else if (privacyStatus === 'private') {
             privateCount++;
           }
 
@@ -191,7 +158,7 @@ export class YouTubeSyncService {
         data: {
           level: 'INFO',
           category: 'SYNC',
-          message: `Sincronização concluída: ${stats.total} vídeos`,
+          message: `Sincronização com o YouTube concluída: ${stats.total} vídeos`,
           metadata: JSON.stringify(stats),
         },
       });
@@ -202,7 +169,7 @@ export class YouTubeSyncService {
         where: { channelId: channel.id },
         data: {
           status: 'ERROR',
-          errorMessage: err.message || 'Erro desconhecido durante sincronização',
+          errorMessage: err.message || 'Erro desconhecido durante sincronização com o YouTube',
         },
       });
 
@@ -210,85 +177,11 @@ export class YouTubeSyncService {
         data: {
           level: 'ERROR',
           category: 'SYNC',
-          message: `Falha na sincronização: ${err.message}`,
+          message: `Falha na sincronização com o YouTube: ${err.message}`,
         },
       });
 
       throw err;
     }
-  }
-
-  private static async syncMockVideos(channelId: string): Promise<SyncStats> {
-    const now = new Date();
-    const mockVideos = [
-      {
-        youtubeVideoId: 'mock_vid_pub_1',
-        title: '01 - O que é Inteligência Artificial Geral (AGI)',
-        description: 'Primeiro vídeo da série sobre evolução de Inteligência Artificial.',
-        privacyStatus: 'public',
-        publishAt: null,
-        publishedAt: new Date(now.getTime() - 1000 * 3600 * 48),
-        thumbnails: JSON.stringify({
-          medium: { url: 'https://images.unsplash.com/photo-1618005182384-a83a8bd57fbe?w=320&auto=format&fit=crop&q=80' },
-        }),
-        tags: JSON.stringify(['ia', 'agi', 'tecnologia']),
-      },
-      {
-        youtubeVideoId: 'mock_vid_pub_2',
-        title: '02 - Como Funcionam os Modelos LLM',
-        description: 'Explicando transformers, atenção e embeddings de forma simples.',
-        privacyStatus: 'public',
-        publishAt: null,
-        publishedAt: new Date(now.getTime() - 1000 * 3600 * 24),
-        thumbnails: JSON.stringify({
-          medium: { url: 'https://images.unsplash.com/photo-1620712943543-bcc4688e7485?w=320&auto=format&fit=crop&q=80' },
-        }),
-        tags: JSON.stringify(['ia', 'llm', 'deeplearning']),
-      },
-      {
-        youtubeVideoId: 'mock_vid_sched_1',
-        title: '03 - Agentes Autônomos na Prática',
-        description: 'Demonstração de execução com subagentes e ferramentas locais.',
-        privacyStatus: 'private',
-        publishAt: new Date(now.getTime() + 1000 * 3600 * 20), // 20h no futuro (amanhã)
-        publishedAt: null,
-        thumbnails: JSON.stringify({
-          medium: { url: 'https://images.unsplash.com/photo-1677442136019-21780ecad995?w=320&auto=format&fit=crop&q=80' },
-        }),
-        tags: JSON.stringify(['agentes', 'ia', 'automacao']),
-      },
-      {
-        youtubeVideoId: 'mock_vid_sched_2',
-        title: '04 - O Futuro do Trabalho com IA',
-        description: 'Análise de tendências de produtividade e novas profissões.',
-        privacyStatus: 'private',
-        publishAt: new Date(now.getTime() + 1000 * 3600 * 44), // 44h no futuro (depois de amanhã)
-        publishedAt: null,
-        thumbnails: JSON.stringify({
-          medium: { url: 'https://images.unsplash.com/photo-1485827404703-89b55fcc595e?w=320&auto=format&fit=crop&q=80' },
-        }),
-        tags: JSON.stringify(['futuro', 'carreira', 'tecnologia']),
-      },
-    ];
-
-    for (const v of mockVideos) {
-      await prisma.syncedVideo.upsert({
-        where: { youtubeVideoId: v.youtubeVideoId },
-        create: {
-          channelId,
-          ...v,
-        },
-        update: {
-          ...v,
-        },
-      });
-    }
-
-    return {
-      total: mockVideos.length,
-      published: 2,
-      scheduled: 2,
-      private: 0,
-    };
   }
 }
