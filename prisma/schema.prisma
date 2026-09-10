@@ -1,0 +1,144 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model AppSetting {
+  id        String   @id @default(cuid())
+  key       String   @unique
+  value     String
+  updatedAt DateTime @updatedAt
+}
+
+model Channel {
+  id                String         @id @default(cuid())
+  youtubeChannelId  String         @unique
+  title             String
+  thumbnailUrl      String?
+  uploadsPlaylistId String?
+  createdAt         DateTime       @default(now())
+  updatedAt         DateTime       @updatedAt
+  oauthAccount      OAuthAccount?
+  syncState         SyncState?
+  syncedVideos      SyncedVideo[]
+  uploadProfiles    UploadProfile[]
+}
+
+model OAuthAccount {
+  id           String    @id @default(cuid())
+  channelId    String    @unique
+  channel      Channel   @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  accessToken  String
+  refreshToken String?
+  tokenType    String    @default("Bearer")
+  scope        String?
+  expiresAt    DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+}
+
+model SyncState {
+  id            String    @id @default(cuid())
+  channelId     String    @unique
+  channel       Channel   @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  status        String    @default("IDLE") // IDLE, SYNCING, ERROR
+  lastSyncedAt  DateTime?
+  errorMessage  String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+}
+
+model SyncedVideo {
+  id                    String    @id @default(cuid())
+  channelId             String
+  channel               Channel   @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  youtubeVideoId        String    @unique
+  title                 String
+  description           String?
+  privacyStatus         String    // public, private, unlisted
+  publishAt             DateTime? // Para agendados (privado + data futura)
+  publishedAt           DateTime?
+  thumbnails            String?   // JSON serializado
+  tags                  String?   // JSON serializado (array de strings)
+  categoryId            String?
+  madeForKids           Boolean?  @default(false)
+  containsSyntheticMedia Boolean? @default(false)
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+
+  @@index([channelId, publishAt])
+  @@index([privacyStatus])
+}
+
+model Batch {
+  id              String       @id @default(cuid())
+  status          String       @default("DRAFT") // DRAFT, READY, RUNNING, PAUSED, COMPLETED, PARTIAL, CANCELED, FAILED
+  totalVideos     Int          @default(0)
+  completedVideos Int          @default(0)
+  failedVideos    Int          @default(0)
+  drafts          VideoDraft[]
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+}
+
+model VideoDraft {
+  id                String    @id @default(cuid())
+  batchId           String
+  batch             Batch     @relation(fields: [batchId], references: [id], onDelete: Cascade)
+  localPath         String
+  filename          String
+  fileSize          BigInt?
+  title             String
+  orderIndex        Int
+  scheduledAt       DateTime?
+  customDescription String?
+  customTags        String?   // JSON array de tags
+  thumbnailPath     String?
+  playlistId        String?
+  youtubeVideoId    String?   // Preenchido imediatamente assim que a API responde
+  status            String    @default("PENDING") // PENDING, VALIDATING, UPLOADING, UPLOADED, VERIFYING, SCHEDULED, FAILED, CANCELED
+  errorMessage      String?
+  retryCount        Int       @default(0)
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  @@index([batchId, orderIndex])
+  @@index([youtubeVideoId])
+}
+
+model UploadProfile {
+  id                    String   @id @default(cuid())
+  channelId             String?
+  channel               Channel? @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  name                  String
+  isDefault             Boolean  @default(false)
+  defaultDescription    String?
+  defaultTags           String?  // JSON array de tags
+  categoryId            String?
+  defaultLanguage       String?  @default("pt")
+  madeForKids           Boolean  @default(false)
+  containsSyntheticMedia Boolean @default(false)
+  license               String?  @default("youtube")
+  embeddable            Boolean  @default(true)
+  publicStatsViewable   Boolean  @default(true)
+  playlistId            String?
+  notifySubscribers     Boolean  @default(true)
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+}
+
+model OperationLog {
+  id        String   @id @default(cuid())
+  level     String   // INFO, WARN, ERROR
+  category  String   // AUTH, SYNC, UPLOAD, SCHEDULER, SYSTEM
+  message   String
+  metadata  String?  // JSON sanitizado (nunca gravar tokens/senhas)
+  createdAt DateTime @default(now())
+
+  @@index([level, createdAt])
+  @@index([category])
+}

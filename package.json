@@ -1,0 +1,28 @@
+{
+  "name": "tubesender",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Gerenciador local de uploads, agendamentos e histórico do YouTube",
+  "scripts": {
+    "dev": "pnpm --parallel --filter @tubesender/api --filter @tubesender/web dev",
+    "dev:api": "pnpm --filter @tubesender/api dev",
+    "dev:web": "pnpm --filter @tubesender/web dev",
+    "build": "pnpm --filter @tubesender/shared build && pnpm --filter @tubesender/api build && pnpm --filter @tubesender/web build",
+    "test": "pnpm --recursive --if-present run test",
+    "lint": "pnpm --recursive --if-present run lint",
+    "typecheck": "pnpm --recursive run typecheck",
+    "db:migrate": "prisma migrate dev --schema=prisma/schema.prisma",
+    "db:generate": "prisma generate --schema=prisma/schema.prisma",
+    "db:studio": "prisma studio --schema=prisma/schema.prisma"
+  },
+  "dependencies": {
+    "@prisma/client": "^6.4.1"
+  },
+  "devDependencies": {
+    "prisma": "^6.4.1"
+  },
+  "packageManager": "pnpm@11.5.0",
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
